@@ -1,1 +1,1 @@
-# Jenkinsfiles
+# Jenkinsfile template
