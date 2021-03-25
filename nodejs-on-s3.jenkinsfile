@@ -1,0 +1,583 @@
+// Pipeline
+pipeline {
+
+    // Using any agent, as we're working on single instance of Jenkins
+    agent any
+
+    options {
+        // No concurrent builds are allowed
+        disableConcurrentBuilds()
+    }
+
+    // Define environment variables
+    environment {
+
+        // Timestamp
+        def BUILD_TIMESTAMP = sh(script: "echo `date '+%Y-%m-%d-%H_%M_%S_%3N'`", returnStdout: true).trim()
+
+        // Slack
+        SLACK_CHANNEL = ""
+
+        // Artifact repo
+        ARTIFACT_GIT_URL = ""
+        ARTIFACT_GIT_CRED_ID = ""
+
+        // Branches naming convention
+        BRANCH_NAME_DEVELOP = "develop"
+        BRANCH_NAME_MASTER = "master"
+        BRANCH_FILTER_RELEASE = "release/v"
+
+        // Regexp for tags
+        REGEXP_BRANCH_SHELL_RELEASE = "release/v[0-9]*\\.[0-9]*\\.[0-9]*\$"
+        REGEXP_SHELL_TAG_BETA = "v[0-9]*\\.[0-9]*\\.[0-9]*-beta\\.[0-9]*\$"
+        REGEXP_SHELL_TAG_RC = "v[0-9]*\\.[0-9]*\\.[0-9]*-rc\\.[0-9]*\$"
+        REGEXP_SHELL_TAG_STABLE = "v[0-9]*\\.[0-9]*\\.[0-9]*\$"
+
+        // GIT dir
+        APP_SOURCE = "app_source"
+        APP_ARTIFACT_DIR_QA = "app_artifact_qa"
+        APP_ARTIFACT_DIR_STAGING = "app_artifact_staging"
+        APP_ARTIFACT_DIR_PROD = "app_artifact_prod"
+
+        // Syntax for tags
+        SYNTAX_TAG_NAME_BETA = "-beta."
+        SYNTAX_TAG_NAME_RC = "-rc."
+        LETTER_V = "v"
+        SYNTAX_DOT = "."
+        NUMBER_ZERO = "0"
+
+        // Buckets
+        APP_BUCKET_URL_QA = "s3://qa/"
+        APP_BUCKET_URL_STAGING = "s3://staging/"
+        APP_BUCKET_URL_PROD = "s3://prod/"
+
+        // Jenkins Jobs*/
+        JOB_NAME_MR_SUBMITTED = "MR-Submitted"
+        JOB_NAME_DEPLOY_QA = "Deploy-QA"
+        JOB_NAME_DEPLOY_STAGING = "Deploy-Staging"
+        JOB_NAME_DEPLOY_PRODUCTION = "Deploy-Production"
+        JOB_NAME_ROLLBACK_PRODUCTION = "Rollback-Production"
+        JOB_NAME_RELEASE_CREATE = "Create-Release"
+        JOB_NAME_PATCH_RELEASE_CREATE = "Create-Patch-Release"
+        JOB_NAME_RELEASE_FINISH = "Finish-Release"
+        JOB_NAME_DEPLOY_PLAYGROUND_QA = "Deploy-Playground-QA"
+    }
+
+    // Begin stages
+    stages {
+
+        // Prepare for checkout target commit and create new tags
+        stage("Prepare") {
+
+            steps {
+
+                // Get absolute job name
+                script {
+                    jobName = sh(script: "echo $JOB_NAME | sed -e 's~.*/~~g'", returnStdout: true).trim()
+                    // Get latest stable tag
+                    latestTagStable = sh(script: "git tag --sort=-creatordate | grep $REGEXP_SHELL_TAG_STABLE | head -n 1", returnStdout: true).trim()
+                }
+
+                // Print env vars                
+                sh "printenv | sort"
+
+                dir("${APP_SOURCE}") {
+
+                    // Define targe commit
+                    script {
+                        
+                        // Fetch all
+                        sh "git fetch --all"
+
+                        // Check number of release branches
+                        numberOfReleaseBranches = sh(script: "git branch -r | grep $REGEXP_BRANCH_SHELL_RELEASE | wc -l", returnStdout: true).trim()
+                        echo "Number of release branches found is: $numberOfReleaseBranches"
+
+                        // If 1 release branch found
+                        if ( numberOfReleaseBranches == "1" ) {
+
+                            // Save release branch name
+                            releaseBranchName = sh(script: "git branch -r | grep $REGEXP_BRANCH_SHELL_RELEASE | awk '{ print \$1}'", returnStdout: true).trim()
+
+                            // Prune release branch name
+                            releaseBranchName = sh(script: "echo $releaseBranchName | sed -e 's~origin/~~g'", returnStdout: true).trim()
+
+                            echo "Release branch found is: $releaseBranchName"
+                        }
+
+                        // Case: MR Submitted
+                        if( jobName == env.JOB_NAME_MR_SUBMITTED ) {
+
+                            // Set target commit with gitlabMergeRequestLastCommit, which is extracted from hook payload
+                            targetCommit = env.gitlabMergeRequestLastCommit
+
+                        // Case: Dev
+                        } else if ( jobName == JOB_NAME_DEPLOY_PLAYGROUND_QA ) {
+
+                            // Set target commit with branch name selected by user
+                            targetCommit = env.userDefinedCommit
+
+                            // In case of dev or qa playground, next commit is same as target commit, because we deploy branch
+                            nextCommit = env.userDefinedCommit
+
+                        // Case: QA
+                        // Release branch must exist
+                        } else if ( jobName == env.JOB_NAME_DEPLOY_QA ) {
+
+                            // If more than 1 release branch found
+                            if ( numberOfReleaseBranches != "1" ) {
+
+                                // Abort
+                                error("Only 1 release branch must exist to deploy on QA.")
+
+                            } else {
+
+                                // Set target commit with releaseBranchName
+                                targetCommit = releaseBranchName
+
+                                // Get main tag
+                                mainTag = sh(script: "echo $releaseBranchName | sed -e 's~$BRANCH_FILTER_RELEASE~~g'", returnStdout: true).trim()
+                                mainTag = env.LETTER_V + mainTag
+
+                                // Generate next beta tag
+                                nextBetaTag = sh(script: "git tag | grep $REGEXP_SHELL_TAG_BETA | grep $mainTag | wc -l", returnStdout: true).trim()
+                                int nextBetaTagNumber = nextBetaTag as int
+                                nextBetaTagNumber++
+
+                                // Set next tag to be created
+                                nextCommit = mainTag + env.SYNTAX_TAG_NAME_BETA + nextBetaTagNumber
+                            }
+
+                        // Case: Staging (Pre-Prod)
+                        // Release branch must exist
+                        } else if ( jobName == env.JOB_NAME_DEPLOY_STAGING ) {
+
+                            // If more than 1 release branch found
+                            if ( numberOfReleaseBranches != "1" ) {
+
+                                // Abort
+                                error("Only 1 release branch must exist to deploy on Staging (Pre-Prod).")
+
+                            } else {
+                                
+                                // Get main tag name
+                                mainTag = sh(script: "echo $releaseBranchName | sed -e 's~$BRANCH_FILTER_RELEASE~~g'", returnStdout: true).trim()
+                                mainTag = env.LETTER_V + mainTag
+
+                                // Get latest beta tag
+                                latestTagBeta = sh(script: "git tag --sort=-creatordate | grep $REGEXP_SHELL_TAG_BETA | grep $mainTag | head -n 1", returnStdout: true).trim()
+
+                                // Set target commit
+                                targetCommit = latestTagBeta
+                                
+                                // Get next rc tag number
+                                nextRCTag = sh(script: "git tag | grep $REGEXP_SHELL_TAG_RC | grep $mainTag | wc -l", returnStdout: true).trim()
+                                int nextRCTagNumber = nextRCTag as int
+                                nextRCTagNumber++
+
+                                // Set next rc tag name
+                                nextCommit = mainTag + env.SYNTAX_TAG_NAME_RC + nextRCTagNumber
+                            }
+
+                        // Case: production
+                        // Release branch must exist
+                        } else if ( jobName == env.JOB_NAME_DEPLOY_PRODUCTION ) {
+
+                            // If more than 1 release branch found
+                            if ( numberOfReleaseBranches != "1" ) {
+
+                                // Abort
+                                error("Only 1 release branch must exist to deploy on Production.")
+
+                            } else {
+
+                                // Get main tag name
+                                mainTag = sh(script: "echo $releaseBranchName | sed -e 's~$BRANCH_FILTER_RELEASE~~g'", returnStdout: true).trim()
+                                mainTag = env.LETTER_V + mainTag
+
+                                // Get latest rc tag
+                                latestTagRc = sh(script: "git tag --sort=-creatordate | grep $REGEXP_SHELL_TAG_RC | grep $mainTag | head -n 1", returnStdout: true).trim()
+
+                                // Set target commit
+                                targetCommit = latestTagRc
+
+                                // Set next stable tag name
+                                nextCommit = mainTag
+                            }
+
+                        // Rollback Production
+                        } else if ( jobName == env.JOB_NAME_ROLLBACK_PRODUCTION ) {
+                            
+                            // In case of rollback both target & next commit are user spicified
+                            // At the time being target commit is not needed in this case, but it is added for consistency purpose in the future
+                            targetCommit = env.userDefinedCommit
+                            nextCommit = env.userDefinedCommit
+
+                        // Create release
+                        } else if ( jobName == env.JOB_NAME_RELEASE_CREATE ) {
+
+                            // If release branch found
+                            if ( numberOfReleaseBranches != "0" ) {
+
+                                // Abort
+                                error("Release branch already found, to start new release you must finish the last one first.")
+
+                            } else {
+
+                                // Set target commit with develop branch to create release branch from it
+                                targetCommit = env.BRANCH_NAME_DEVELOP
+                            }
+                            
+                        // Create patch release
+                        } else if ( jobName == env.JOB_NAME_PATCH_RELEASE_CREATE ) {
+
+                            // If release branch found
+                            if ( numberOfReleaseBranches != "0" ) {
+
+                                // Abort
+                                error("Release branch already found, to start new release you must finish the last one first.")
+
+                            } else {
+
+                                // Set target commit with develop branch to create release branch from it
+                                targetCommit = latestTagStable
+                            }
+
+                        // Finish release
+                        } else if ( jobName == env.JOB_NAME_RELEASE_FINISH ) {
+                            
+                            // Set target commit with develop branch to merge release branch into it
+                            targetCommit = env.BRANCH_NAME_DEVELOP
+
+                            // If only 1 release branch was found in Prepare stage
+                            if ( numberOfReleaseBranches == "1" ) {
+
+                                // 1 release branch found
+                                echo "OK found 1 release branch."
+
+                            } else if ( numberOfReleaseBranches == "0" ) {
+
+                                // No release branch found
+                                error("No release branch found.")
+
+                            } else {
+
+                                // More than 1 release branch found
+                                error("Found more than 1 release branch, please prune git repo manually.")
+                            }
+                        }
+                    }
+
+                    echo "Target commit is: $targetCommit"
+                }
+            }
+        }
+
+        // Checkout
+        stage ("Checkout") {
+            steps {
+
+                dir("${APP_SOURCE}") {
+
+                    // Checkout target commit
+                    echo "Checkout target commit: $targetCommit"
+                    sh "git checkout $targetCommit"
+                }
+            }
+        }
+
+        // Create release
+        stage ("Create Release") {
+            when {
+                anyOf {
+                    expression { jobName == env.JOB_NAME_RELEASE_CREATE }
+                    expression { jobName == env.JOB_NAME_PATCH_RELEASE_CREATE }    
+                }
+            }
+
+            steps {
+
+                dir("${APP_SOURCE}") {
+
+                    // Create new release branch
+                    script {
+                        
+                        // Major version
+                        major = sh(script: "echo $latestTagStable | sed -e 's~v~~g' | sed -e 's~\\.[0-9]*\\.[0-9]*~~g'", returnStdout: true).trim()
+
+                        // Minor version
+                        minor = sh(script: "echo $latestTagStable | sed -e 's~v[0-9]*\\.~~g' | sed -e 's~\\.[0-9]*~~g'", returnStdout: true).trim()
+
+                        // Patch version
+                        patch = sh(script: "echo $latestTagStable | sed -e 's~v[0-9]*\\.[0-9]*\\.~~g'", returnStdout: true).trim()
+
+                        if ( jobName == env.JOB_NAME_RELEASE_CREATE ) {
+
+                            // Increment minor version
+                            int nextMinor = minor as int
+                            nextMinor++
+
+                            // Create new release branch name
+                            newReleaseBranchName = env.BRANCH_FILTER_RELEASE + major + env.SYNTAX_DOT + nextMinor + env.SYNTAX_DOT + env.NUMBER_ZERO
+
+                        } else if ( jobName == env.JOB_NAME_PATCH_RELEASE_CREATE ) {
+
+                            // Increment minor version
+                            int nextPatch = patch as int
+                            nextPatch++
+
+                            // Set new release branch name
+                            newReleaseBranchName = env.BRANCH_FILTER_RELEASE + major + env.SYNTAX_DOT + minor + env.SYNTAX_DOT + nextPatch
+                        }
+
+                    }
+
+                    // Create new release branch
+                    sh "git checkout -b $newReleaseBranchName && \
+                        git push --set-upstream origin $newReleaseBranchName"
+                }
+            }
+        }
+
+        // Finish release
+        stage ("Finish Release") {
+            when {
+                expression { jobName == env.JOB_NAME_RELEASE_FINISH }
+            }
+
+            steps {
+
+                dir("${APP_SOURCE}") {
+
+                    script {
+
+                        // Fetch all
+                        // Checkout & merge to develop
+                        sh "git fetch --all && \
+                            git checkout $releaseBranchName && \
+                            git checkout $BRANCH_NAME_DEVELOP"
+
+                        sh(script: "git merge $releaseBranchName", returnStdout: true).trim()
+
+                        // Push to git server
+                        // Checkout & merge to master
+                        sh "git push && \
+                            git checkout $releaseBranchName && \
+                            git checkout $BRANCH_NAME_MASTER"
+
+                        sh(script: "git merge $releaseBranchName", returnStdout: true).trim()
+
+                        // Push again to git server
+                        // Remove release branch
+                        sh "git push && \
+                            git push origin --delete $releaseBranchName"
+                    }
+                }
+            }
+        }
+
+        // Build application
+        stage("Build") {
+
+            when {
+
+                anyOf {
+                    expression { jobName == env.JOB_NAME_MR_SUBMITTED }
+                    expression { jobName == env.JOB_NAME_DEPLOY_QA }
+                    expression { jobName == env.JOB_NAME_DEPLOY_PLAYGROUND_QA }
+                }
+            }
+            steps {
+                dir("${APP_SOURCE}") {
+
+                    // Install
+                    sh "npm i"
+                    sh "npm run build"
+                }
+            }
+        }
+
+        // Create Artifact
+        stage("Create Artifact") {
+
+            parallel {
+
+                // Build QA artifact
+                stage ("QA") {
+                    when {
+                        expression { jobName == env.JOB_NAME_DEPLOY_QA }
+                    }
+                    steps {
+
+                        // Clone artifact
+                        dir ("${APP_ARTIFACT_DIR_QA}") {
+                            // Clone artifact repo
+                            git credentialsId: env.ARTIFACT_GIT_CRED_ID, url: env.ARTIFACT_GIT_URL
+                        }
+
+                        // Sync from source to artifact
+                        sh "rsync -rtvq --delete --exclude .git/ --exclude .gitignore --exclude .gitignore.docroot --exclude .gitlab-ci.yml --links ./${APP_SOURCE}/build/ ./${APP_ARTIFACT_DIR_QA}/"
+
+                        dir ("${APP_ARTIFACT_DIR_QA}") {
+
+                            // Push artifact into new tag
+                            sh "git status && \
+                                git add . && \
+                                git commit -qm \"Artifact built by Jenkinsfile\" || echo \"Nothing to commit, working tree clean\" && \
+                                git tag -a ${nextCommit} -m \"Auto created by Jenkinsfile\" && \
+                                git push origin --tags"
+                        }
+
+                        dir ("${APP_SOURCE}") {
+
+                            // Create beta tag on source repo
+                            sh "git tag -a ${nextCommit} -m \"Auto created by Jenkinsfile on release branch: ${targetCommit}\" && \
+                                git push origin --tags"
+                        }
+                    }
+                }
+
+                // Build Staging artifact
+                stage ("Staging") {
+                    when {
+                        expression { jobName == env.JOB_NAME_DEPLOY_STAGING }
+                    }
+                    steps {
+
+                        dir ("${APP_ARTIFACT_DIR_STAGING}") {
+
+                            // Clone artifact repo
+                            git credentialsId: env.ARTIFACT_GIT_CRED_ID, url: env.ARTIFACT_GIT_URL
+
+                            // Create RC tag
+                            sh "git checkout ${targetCommit} && \
+                                git tag -a ${nextCommit} -m \"Auto created by Jenkinsfile - copy from beta tag: ${targetCommit}\" && \
+                                git push origin --tags"
+                        }
+
+                        dir ("${APP_SOURCE}") {
+
+                            // Create rc tag on source repo
+                            sh "git tag -a ${nextCommit} -m \"Auto created by Jenkinsfile - copy from beta tag: ${targetCommit}\" && \
+                                git push origin --tags"
+                        }
+                    }
+                }
+
+                // Creata stable tag
+                stage ("Prod") {
+                    when {
+                        expression { jobName == env.JOB_NAME_DEPLOY_PRODUCTION }
+                    }
+                    steps {
+
+                        dir ("${APP_ARTIFACT_DIR_PROD}") {
+
+                            // Clone artifact repo
+                            git credentialsId: env.ARTIFACT_GIT_CRED_ID, url: env.ARTIFACT_GIT_URL
+
+                            // Create stable tag
+                            sh "git checkout ${targetCommit} && \
+                                git tag -a ${nextCommit} -m \"Auto created by Jenkinsfile - copy from rc tag: ${targetCommit}\" && \
+                                git push origin --tags"
+                        }
+
+                        dir ("${APP_SOURCE}") {
+
+                            // Create stable tag on source repo
+                            sh "git tag -a ${nextCommit} -m \"Auto created by Jenkinsfile - copy from rc tag: ${targetCommit}\" && \
+                                git push origin --tags"
+                        }
+                    }
+                }
+            }
+        }
+
+        // Approval
+        stage('Approval') {
+
+            // No agent means executors are free while waiting for approvals
+            agent none
+
+            when {
+                anyOf {
+                    expression { jobName == env.JOB_NAME_DEPLOY_PRODUCTION }
+                    expression { jobName == env.JOB_NAME_ROLLBACK_PRODUCTION }
+                }
+            }
+
+            // Wait for approval
+            steps {
+                script {
+
+                    // User Input
+                    def deploymentDelay = input message: "Deploy to production?", parameters: [choice(choices: ['0', '1', '2', '3', '4', '5', '6', '7'], description: 'Hours to delay deployment', name: 'deploymentDelay')]
+
+                    // Sleep
+                    sleep time: deploymentDelay.toInteger(), unit: 'HOURS'
+                }
+            }
+        }
+
+        // Deploy
+        stage("Deploy") {
+            
+            parallel {
+
+                // QA
+                stage ("QA") {
+                    when {
+                        anyOf {
+                            expression { jobName == env.JOB_NAME_DEPLOY_QA }
+                            expression { jobName == env.JOB_NAME_DEPLOY_PLAYGROUND_QA }
+                        }
+                    }
+                    steps {
+                        dir ("${APP_ARTIFACT_DIR_QA}") {
+                            sh "aws s3 sync . ${APP_BUCKET_URL_QA} --delete"
+                        }
+                    }
+                }
+
+                // Staging
+                stage ("Staging") {
+                    when {
+                        expression { jobName == env.JOB_NAME_DEPLOY_STAGING }
+                    }
+                    steps {
+                        dir ("${APP_ARTIFACT_DIR_STAGING}") {
+                            sh "aws s3 sync . ${APP_BUCKET_URL_STAGING} --delete"
+                        }
+                    }
+                }
+
+                // Production
+                stage ("Production") {
+                    when {
+                        anyOf {
+                            expression { jobName == env.JOB_NAME_DEPLOY_PRODUCTION }
+                            expression { jobName == env.JOB_NAME_ROLLBACK_PRODUCTION }
+                        }
+                    }
+                    steps {
+                        dir ("${APP_ARTIFACT_DIR_PROD}") {
+                            sh "aws s3 sync . ${APP_BUCKET_URL_PROD} --delete"
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    post {
+        success {
+            slackSend color: '#66FF00', channel: "${env.SLACK_CHANNEL}", message: "Success | ${JOB_NAME} - <$BUILD_URL| Build #${env.BUILD_NUMBER}> - Duration: ${currentBuild.durationString.minus(' and counting')}"
+        }
+        failure {
+            slackSend color: '#FF3333', channel: "${env.SLACK_CHANNEL}", message: "Failed | ${JOB_NAME} - <$BUILD_URL| Build #${env.BUILD_NUMBER}> - Duration: ${currentBuild.durationString.minus(' and counting')}"
+        }
+        always {
+            deleteDir()
+        }
+    }
+}
